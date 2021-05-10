@@ -2,25 +2,20 @@ from __future__ import annotations
 from typing import *
 
 from array import array
-from dataclasses import dataclass
-import math
-import miniaudio
+import asyncio
+from dataclasses import dataclass, field
+import sys
 import time
+
+from fm.audio import sine_array, get_miniaudio_playback_device
+from fm.midi import MidiMessage, get_midi_ports, STRIP_CHANNEL, GET_CHANNEL, NOTE_ON
+from fm.notes import note_to_freq
 
 __version__ = "0.1.0"
 
-INT16_MAX = 2 ** 15 - 1
 
 if TYPE_CHECKING:
-    Audio = Generator[array[int], int, None]
-
-
-def sine_array(sample_count: int) -> array[int]:
-    numbers = []
-    for i in range(sample_count):
-        current = round(INT16_MAX * math.sin(i / sample_count * math.tau))
-        numbers.append(current)
-    return array("h", numbers)
+    from fm.audio import Audio
 
 
 @dataclass
@@ -52,56 +47,125 @@ class Envelope:
         return envelope
 
 
-def envelop(audio: Audio, envelope: Envelope) -> Audio:
-    result = next(audio)
-    want_frames = yield result
+@dataclass
+class Synthesizer:
+    polyphony: int
+    sample_rate: int
+    voices: list[Voice] = field(init=False)
+    _note_on_counter: int = 0
 
-    out_buffer = array("h", [0] * want_frames)
+    def out(self) -> Audio:
+        voice_outs = [voice.out() for voice in self.voices]
+        for voice_out in voice_outs:
+            next(voice_out)
+        mix_down = 1 / self.polyphony
+        out_buffer = array("h", [0] * (self.sample_rate // 10))  # 100ms
+        want_frames = yield out_buffer
+        while True:
+            output_signals = [v.send(want_frames) for v in voice_outs]
+            for i in range(want_frames):
+                out_buffer[i] = int(sum([mix_down * o[i] for o in output_signals]))
+            want_frames = yield out_buffer[:want_frames]
+
+    def note_on(self, note: int, velocity: int) -> None:
+        try:
+            pitch = note_to_freq[note]
+        except KeyError:
+            return
+        volume = velocity / 127
+        self.voices[self._note_on_counter % self.polyphony].note_on(pitch, volume)
+        self._note_on_counter += 1
+
+    def __post_init__(self) -> None:
+        self.voices = [
+            Voice(
+                wave=sine_array(2048),
+                sample_rate=self.sample_rate,
+                envelope=Envelope(attack=44, decay=8820),
+            )
+            for _ in range(self.polyphony)
+        ]
+
+
+@dataclass
+class Voice:
+    wave: array[int]
+    sample_rate: int
+    envelope: Envelope
+    volume: float = 1.0  # 0.0 - 1.0
+    pitch: float = 440.0  # Hz
+    reset: bool = False
+
+    def out(self) -> Audio:
+        out_buffer = array("h", [0] * (self.sample_rate // 10))  # 100ms
+        want_frames = yield out_buffer
+        w_i = 0.0
+        while True:
+            w = self.wave
+            w_len = len(w)
+            eg = self.envelope
+            for i in range(want_frames):
+                out_buffer[i] = int(self.volume * eg.advance() * w[round(w_i) % w_len])
+                w_i += w_len * self.pitch / self.sample_rate
+            if self.reset:
+                self.reset = False
+                self.envelope.samples_advanced = 0
+            want_frames = yield out_buffer[:want_frames]
+
+    def note_on(self, pitch: float, volume: float) -> None:
+        self.reset = True
+        self.pitch = pitch
+        self.volume = volume
+
+
+async def midi_consumer(queue: asyncio.Queue[MidiMessage], synth: Synthesizer) -> None:
     while True:
-        mono_buffer = audio.send(want_frames)
-        for i in range(want_frames):
-            out_buffer[i] = int(envelope.advance() * mono_buffer[i])
-        want_frames = yield out_buffer[:want_frames]
+        msg, delta, sent_time = await queue.get()
+        t = msg[0]
+        st = t & STRIP_CHANNEL
+        ch = -1
+        if st != STRIP_CHANNEL:
+            ch = t & GET_CHANNEL
+            t = st
+        if t == NOTE_ON:
+            synth.note_on(msg[1], msg[2])
 
 
-def endless_sine(sample_count: int) -> Audio:
-    sine = sine_array(sample_count)
-    result = array("h")
-    want_frames = yield result
-    i = 0
-    while True:
-        result = array("h")
-        left = want_frames
-        while left:
-            left = want_frames - len(result)
-            result.extend(sine[i : i + left])
-            i += left
-            if i > sample_count - 1:
-                i = 0
-        want_frames = yield result
+async def async_main(synth: Synthesizer, midi_in_name: str, channel: int) -> None:
+    queue: asyncio.Queue[MidiMessage] = asyncio.Queue(maxsize=256)
+    loop = asyncio.get_event_loop()
 
+    try:
+        midi_in, midi_out = get_midi_ports(midi_in_name, clock_source=True)
+    except ValueError as port:
+        raise ValueError(f"MIDI IN port {midi_in_name} not connected")
 
-def get_miniaudio_playback_device(name: str) -> miniaudio.PlaybackDevice:
-    devices = miniaudio.Devices()
-    playbacks = devices.get_playbacks()
-    for playback in playbacks:
-        if playback["name"] == name:
-            break
-    else:
-        raise LookupError(f"No playback device named {name} available")
+    def midi_callback(msg, data=None):
+        sent_time = time.time()
+        midi_message, event_delta = msg
+        try:
+            loop.call_soon_threadsafe(
+                queue.put_nowait, (midi_message, event_delta, sent_time)
+            )
+        except BaseException as be:
+            print(f"callback exc: {type(be)} {be}", file=sys.stderr)
 
-    return miniaudio.PlaybackDevice(
-        device_id=playback["id"],
-        nchannels=1,
-        sample_rate=44100,
-        output_format=miniaudio.SampleFormat.SIGNED16,
-        buffersize_msec=10,
-    )
+    midi_in.set_callback(midi_callback)
+    midi_out.close_port()  # we won't be using that one now
+
+    try:
+        await midi_consumer(queue, synth)
+    except asyncio.CancelledError:
+        midi_in.cancel_callback()
 
 
 def main() -> None:
-    stream = envelop(endless_sine(100), Envelope(attack=410, decay=44100))
+    synth = Synthesizer(sample_rate=44100, polyphony=4)
+    stream = synth.out()
     next(stream)
     with get_miniaudio_playback_device("BlackHole 16ch") as dev:
         dev.start(stream)
-        time.sleep(2.0)
+        try:
+            asyncio.run(async_main(synth, midi_in_name="IAC fmsynth", channel=1))
+        except KeyboardInterrupt:
+            pass

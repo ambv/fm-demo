@@ -7,6 +7,7 @@ authors = ["Łukasz Langa <lukasz@langa.pl>"]
 [tool.poetry.dependencies]
 python = "^3.9"
 miniaudio = "1.42"
+python-rtmidi = "^1.4.9"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"
