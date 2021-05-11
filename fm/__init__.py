@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import sys
 import time
 
-from fm.audio import sine_array, get_miniaudio_playback_device
+from fm.audio import sine_array, get_miniaudio_playback_device, saturate, INT16_MAX
 from fm.midi import MidiMessage, get_midi_ports, STRIP_CHANNEL, GET_CHANNEL, NOTE_ON
 from fm.notes import note_to_freq
 
@@ -15,7 +15,7 @@ __version__ = "0.1.0"
 
 
 if TYPE_CHECKING:
-    from fm.audio import Audio
+    from fm.audio import Audio, FMAudio
 
 
 @dataclass
@@ -51,7 +51,7 @@ class Envelope:
 class Synthesizer:
     polyphony: int
     sample_rate: int
-    voices: list[Voice] = field(init=False)
+    voices: list[PhaseModulator] = field(init=False)
     _note_on_counter: int = 0
 
     def out(self) -> Audio:
@@ -78,44 +78,132 @@ class Synthesizer:
 
     def __post_init__(self) -> None:
         self.voices = [
-            Voice(
+            PhaseModulator(
                 wave=sine_array(2048),
                 sample_rate=self.sample_rate,
-                envelope=Envelope(attack=44, decay=8820),
             )
             for _ in range(self.polyphony)
         ]
 
 
 @dataclass
-class Voice:
+class Operator:
     wave: array[int]
     sample_rate: int
     envelope: Envelope
     volume: float = 1.0  # 0.0 - 1.0
     pitch: float = 440.0  # Hz
     reset: bool = False
+    current_note_volume: float = 0.0
 
-    def out(self) -> Audio:
+    def out(self) -> FMAudio:
         out_buffer = array("h", [0] * (self.sample_rate // 10))  # 100ms
-        want_frames = yield out_buffer
+        modulator = yield out_buffer
+        mod_len = len(modulator)
         w_i = 0.0
         while True:
             w = self.wave
             w_len = len(w)
             eg = self.envelope
-            for i in range(want_frames):
-                out_buffer[i] = int(self.volume * eg.advance() * w[round(w_i) % w_len])
+            for i, mod in enumerate(modulator):
+                mod_scaled = mod * w_len / INT16_MAX
+                out_buffer[i] = int(
+                    self.current_note_volume
+                    * self.volume
+                    * eg.advance()
+                    * w[round(w_i + mod_scaled) % w_len]
+                )
                 w_i += w_len * self.pitch / self.sample_rate
             if self.reset:
                 self.reset = False
                 self.envelope.samples_advanced = 0
-            want_frames = yield out_buffer[:want_frames]
+            modulator = yield out_buffer[:mod_len]
+            mod_len = len(modulator)
 
     def note_on(self, pitch: float, volume: float) -> None:
         self.reset = True
         self.pitch = pitch
-        self.volume = volume
+        self.current_note_volume = volume
+
+
+@dataclass
+class PhaseModulator:
+    wave: array[int]
+    sample_rate: int
+    algorithm: int = 3
+    rate1: float = 1.0  # detune by adding cents
+    rate2: float = 1.01
+    rate3: float = 19.0
+    op1: Operator = field(init=False)
+    op2: Operator = field(init=False)
+    op3: Operator = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.op1 = Operator(
+            wave=self.wave,
+            sample_rate=self.sample_rate,
+            envelope=Envelope(attack=48, decay=self.sample_rate),
+        )
+        self.op2 = Operator(
+            wave=self.wave,
+            sample_rate=self.sample_rate,
+            envelope=Envelope(attack=48, decay=self.sample_rate),
+            volume=0.5,
+        )
+        self.op3 = Operator(
+            wave=self.wave,
+            sample_rate=self.sample_rate,
+            envelope=Envelope(attack=24, decay=self.sample_rate // 12),
+            volume=0.2,
+        )
+
+    def note_on(self, pitch: float, volume: float) -> None:
+        self.op1.note_on(pitch * self.rate1, volume)
+        self.op2.note_on(pitch * self.rate2, volume)
+        self.op3.note_on(pitch * self.rate3, volume)
+
+    def out(self) -> Audio:
+        out_buffer = array("h", [0] * (self.sample_rate // 10))  # 100ms
+        zero_buffer = array("h", [0] * (self.sample_rate // 10))  # 100ms
+        op1 = self.op1.out()
+        op2 = self.op2.out()
+        op3 = self.op3.out()
+        next(op1)
+        next(op2)
+        next(op3)
+        want_frames = yield out_buffer
+
+        while True:
+            algo = self.algorithm
+            out3 = op3.send(zero_buffer[:want_frames])
+            if algo == 0:
+                out2 = op2.send(out3)
+                out1 = op1.send(out2)
+                want_frames = yield out1
+            elif algo == 1:
+                out2 = op2.send(zero_buffer[:want_frames])
+                for i in range(want_frames):
+                    out_buffer[i] = saturate(out3[i] + out2[i])
+                out1 = op1.send(out_buffer[:want_frames])
+                want_frames = yield out1
+            elif algo == 2:
+                out2 = op2.send(out3)
+                out1 = op1.send(out3)
+                for i in range(want_frames):
+                    out_buffer[i] = saturate(out1[i] + out2[i])
+                want_frames = yield out_buffer[:want_frames]
+            elif algo == 3:
+                out2 = op2.send(out3)
+                out1 = op1.send(zero_buffer[:want_frames])
+                for i in range(want_frames):
+                    out_buffer[i] = saturate(out1[i] + out2[i])
+                want_frames = yield out_buffer[:want_frames]
+            else:
+                out2 = op2.send(zero_buffer[:want_frames])
+                out1 = op1.send(zero_buffer[:want_frames])
+                for i in range(want_frames):
+                    out_buffer[i] = saturate(out1[i] + out2[i] + out3[i])
+                want_frames = yield out_buffer[:want_frames]
 
 
 async def midi_consumer(queue: asyncio.Queue[MidiMessage], synth: Synthesizer) -> None:

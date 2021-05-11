@@ -9,6 +9,7 @@ import miniaudio
 
 if TYPE_CHECKING:
     Audio = Generator[array[int], int, None]
+    FMAudio = Generator[array[int], array[int], None]
 
 
 INT16_MAX = 2 ** 15 - 1
@@ -37,6 +38,10 @@ def endless_sine(sample_count: int) -> Audio:
             if i > sample_count - 1:
                 i = 0
         want_frames = yield result
+
+
+def saturate(value: float) -> int:
+    return max(min(int(value), INT16_MAX), -INT16_MAX)
 
 
 def get_miniaudio_playback_device(name: str) -> miniaudio.PlaybackDevice:
