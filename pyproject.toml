@@ -15,7 +15,12 @@ mypy = "^0.812"
 black = "^21.5b0"
 rich = "^10.1.0"
 bpython = "^0.21"
+Cython = "^0.29.23"
+
+[tool.poetry.build]
+generate-setup-file = false
+script = "build.py"
 
 [build-system]
-requires = ["poetry-core>=1.0.0"]
+requires = ["poetry-core>=1.0.0", "cython"]
 build-backend = "poetry.core.masonry.api"
